@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
-import { ArrowLeft, MessageCircle, Package, PackageCheck } from 'lucide-react'
+import { useQueryClient } from '@tanstack/react-query'
+import { ArrowLeft, MessageCircle, Package, PackageCheck, RefreshCw } from 'lucide-react'
 import { Container } from '@/components/layout/PublicLayout'
 import { Card } from '@/components/ui/Card'
 import { Button, LinkButton } from '@/components/ui/Button'
@@ -9,8 +10,9 @@ import { StatusPill, orderStatusLabel } from '@/components/ui/Badge'
 import { EmptyState, ErrorState, LoadingScreen, Skeleton } from '@/components/ui/Feedback'
 import { useToast } from '@/components/ui/Toast'
 import { useAuth } from '@/features/auth/AuthProvider'
-import { useMyOrders, useOrder, useOrderEvents } from '@/features/orders/queries'
+import { useMyOrders, useOrder, useOrderEvents, orderKeys } from '@/features/orders/queries'
 import { useStoreSettings } from '@/features/catalog/queries'
+import { verifyPayment } from '@/features/checkout/api'
 import { formatDateTime, formatPrice, formatRelative } from '@/lib/format'
 import { supportWhatsappLink } from '@/lib/contact'
 import { supabase } from '@/lib/supabase'
@@ -77,6 +79,40 @@ export function OrderDetailPage() {
   const { data: order, isLoading } = useOrder(orderId)
   const { data: events } = useOrderEvents(orderId)
   const { data: settings } = useStoreSettings()
+  const queryClient = useQueryClient()
+  const { toast } = useToast()
+  const [checking, setChecking] = useState(false)
+
+  /**
+   * Ask the server to confirm the payment with the gateway directly.
+   *
+   * Gateway callbacks are not guaranteed — they can be delayed, dropped,
+   * or never sent at all. Without this, a buyer who paid and closed the
+   * tab has no way to move their order forward, and the owner gets a
+   * "I paid but it still says pending" message instead.
+   */
+  async function checkPayment() {
+    if (!orderId) return
+    setChecking(true)
+    try {
+      const result = await verifyPayment(orderId)
+      await queryClient.invalidateQueries({ queryKey: orderKeys.one(orderId) })
+      await queryClient.invalidateQueries({ queryKey: orderKeys.events(orderId) })
+      await queryClient.invalidateQueries({ queryKey: orderKeys.mine() })
+
+      if (result.status === 'paid' || result.status === 'delivered') {
+        toast('Payment confirmed. Your order is being prepared.', 'success')
+      } else if (result.unconfirmed) {
+        toast('The gateway did not respond. Please try again in a minute.', 'error')
+      } else {
+        toast('The gateway still shows this payment as not completed.', 'info')
+      }
+    } catch (err) {
+      toast(err instanceof Error ? err.message : 'Could not check the payment.', 'error')
+    } finally {
+      setChecking(false)
+    }
+  }
 
   if (isLoading) return <LoadingScreen />
 
@@ -121,6 +157,25 @@ export function OrderDetailPage() {
 
       <div className="mt-8 grid gap-6 lg:grid-cols-[1.4fr_1fr] lg:items-start">
         <div className="space-y-6">
+          {(order.status === 'pending_payment' || order.status === 'failed') && (
+            <Card className="border border-[var(--warning)]/25">
+              <h2 className="text-sm font-semibold">Already paid for this order?</h2>
+              <p className="mt-1.5 text-sm text-[var(--text-muted)]">
+                If the money has left your account but this still says awaiting payment, the
+                gateway&apos;s confirmation may not have reached us yet. Check directly — we will
+                ask the gateway about this order right now.
+              </p>
+              <Button className="mt-4" loading={checking} onClick={() => void checkPayment()}>
+                <RefreshCw className="size-4" aria-hidden />
+                Check payment status
+              </Button>
+              <p className="mt-3 text-xs text-[var(--text-muted)]">
+                Do not pay again. If it still shows as unpaid after checking, message us with your
+                order number and we will sort it out.
+              </p>
+            </Card>
+          )}
+
           {(paid || delivered) && (
             <Card
               className={
