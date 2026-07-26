@@ -254,6 +254,30 @@ async function handleCreate(req: Request): Promise<Response> {
   const gateway = getGateway()
   const siteUrl = resolveSiteUrl(req)
 
+  // If this order already has a live gateway reference and the gateway
+  // still reports it as payable, reuse it instead of minting another one.
+  // Every extra reference is one more place the buyer's money could land
+  // that we then have to go looking for.
+  if (order.gateway_ref && order.gateway_provider === gateway.id) {
+    try {
+      const existingStatus = await gateway.fetchStatus(order.gateway_ref)
+      if (existingStatus.status === 'paid') {
+        const settled = await settleOrder(db, order, 'paid', existingStatus.raw)
+        return json({
+          orderId: order.id,
+          orderNumber: order.order_number,
+          amountInr: amount,
+          alreadyPaid: true,
+          status: settled.status,
+          redirectUrl: `${siteUrl}/account/orders/${order.id}`,
+          provider: gateway.id,
+        })
+      }
+    } catch {
+      // Status check is best effort here; fall through and create a new one.
+    }
+  }
+
   let initiated
   try {
     initiated = await gateway.initiate({
@@ -359,12 +383,33 @@ async function handleWebhook(rawBody: string, headers: Headers): Promise<Respons
       .eq('gateway_provider', gateway.id)
       .eq('event_id', event.eventId)
 
-  const { data: order } = await db
+  // Match on the order's current reference, or on any attempt we recorded
+  // for it - a retried checkout leaves earlier gateway orders behind.
+  let { data: order } = await db
     .from('orders')
     .select('id, order_number, status, amount_inr, gateway_provider, gateway_ref, product_id')
     .eq('gateway_provider', gateway.id)
     .eq('gateway_ref', event.gatewayRef)
     .maybeSingle()
+
+  if (!order) {
+    const { data: attempt } = await db
+      .from('payment_attempts')
+      .select('order_id')
+      .eq('gateway_provider', gateway.id)
+      .eq('gateway_ref', event.gatewayRef)
+      .limit(1)
+      .maybeSingle()
+
+    if (attempt) {
+      const { data: viaAttempt } = await db
+        .from('orders')
+        .select('id, order_number, status, amount_inr, gateway_provider, gateway_ref, product_id')
+        .eq('id', attempt.order_id)
+        .maybeSingle()
+      order = viaAttempt
+    }
+  }
 
   if (!order) {
     await markEvent('ignored', { error_message: 'no matching order' })
@@ -379,7 +424,12 @@ async function handleWebhook(rawBody: string, headers: Headers): Promise<Respons
     return json({ ok: true, pending: true })
   }
 
-  const result = await settleOrder(db, order as OrderRow, resolved.status, resolved.raw)
+  const result = await settleOrder(
+    db,
+    { ...(order as OrderRow), gateway_ref: event.gatewayRef },
+    resolved.status,
+    resolved.raw,
+  )
   await markEvent('processed', { order_id: order.id })
 
   return json({ ok: true, orderStatus: result.status, changed: result.changed })
@@ -402,7 +452,7 @@ async function handleVerify(req: Request): Promise<Response> {
   if (!orderId) return json({ error: 'orderId is required.' }, 400)
 
   const db = admin()
-  const { data: order } = await db
+  const { data: orderRow } = await db
     .from('orders')
     .select(
       'id, order_number, status, amount_inr, gateway_provider, gateway_ref, product_id, user_id',
@@ -410,25 +460,67 @@ async function handleVerify(req: Request): Promise<Response> {
     .eq('id', orderId)
     .maybeSingle()
 
-  if (!order) return json({ error: 'Order not found.' }, 404)
+  if (!orderRow) return json({ error: 'Order not found.' }, 404)
   // Service role bypasses RLS, so ownership must be checked by hand here.
-  if (order.user_id !== user.id) return json({ error: 'Order not found.' }, 404)
+  if (orderRow.user_id !== user.id) return json({ error: 'Order not found.' }, 404)
+
+  const order = orderRow as unknown as OrderRow
 
   if (order.status !== 'pending_payment' && order.status !== 'failed') {
     return json({ status: order.status, orderNumber: order.order_number })
   }
 
-  if (!order.gateway_ref) {
+  // Every "Pay" click creates a fresh order at the gateway, and the newest
+  // reference overwrites the previous one on our row. If the buyer paid an
+  // earlier attempt, checking only the current reference would report the
+  // order as unpaid while their money is sitting against an abandoned one.
+  // So check every reference we ever created for this order.
+  const { data: attempts } = await db
+    .from('payment_attempts')
+    .select('gateway_ref')
+    .eq('order_id', order.id)
+    .not('gateway_ref', 'is', null)
+    .order('created_at', { ascending: false })
+
+  const refs = [
+    ...new Set(
+      [order.gateway_ref, ...(attempts ?? []).map((a) => a.gateway_ref)].filter(
+        (r): r is string => Boolean(r),
+      ),
+    ),
+  ]
+
+  if (refs.length === 0) {
     return json({ status: order.status, orderNumber: order.order_number })
   }
 
-  const resolved = await resolveStatus('pending', order.gateway_ref)
-  if (!resolved.confirmed) {
-    return json({ status: order.status, orderNumber: order.order_number, unconfirmed: true })
+  let anyConfirmed = false
+
+  for (const ref of refs) {
+    const resolved = await resolveStatus('pending', ref)
+    if (!resolved.confirmed) continue
+    anyConfirmed = true
+
+    if (resolved.status !== 'paid') continue
+
+    // Point the order at the reference that actually carries the money, so
+    // the audit trail and any later callback line up with reality.
+    if (ref !== order.gateway_ref) {
+      await db.from('orders').update({ gateway_ref: ref }).eq('id', order.id)
+      order.gateway_ref = ref
+    }
+
+    const result = await settleOrder(db, order as OrderRow, 'paid', resolved.raw)
+    return json({ status: result.status, orderNumber: order.order_number, settledRef: ref })
   }
 
-  const result = await settleOrder(db, order as OrderRow, resolved.status, resolved.raw)
-  return json({ status: result.status, orderNumber: order.order_number })
+  return json({
+    status: order.status,
+    orderNumber: order.order_number,
+    checkedRefs: refs.length,
+    // Distinguishes "the gateway says not paid" from "the gateway did not answer".
+    unconfirmed: !anyConfirmed,
+  })
 }
 
 // ---------------------------------------------------------------------
