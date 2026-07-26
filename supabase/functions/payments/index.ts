@@ -21,7 +21,35 @@ import { getGateway, hmacSha256Hex, mockSecret, type NormalizedStatus } from './
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL')!
 const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-const SITE_URL = (Deno.env.get('SITE_URL') ?? 'http://localhost:5173').replace(/\/$/, '')
+
+/**
+ * Origins we are willing to send a paying customer back to.
+ *
+ * The return URL has to be an absolute URL, and hard-coding it to a
+ * SITE_URL secret means one forgotten secret sends every buyer to
+ * localhost. Deriving it from the request's Origin fixes that for
+ * production, preview deploys and local dev at once.
+ *
+ * But Origin is attacker-controllable, and this value is handed to the
+ * payment gateway as a redirect target — so it is matched against an
+ * allow-list first. An unrecognised origin falls back to SITE_URL rather
+ * than being trusted, which keeps this from becoming an open redirect.
+ */
+const ALLOWED_ORIGINS = [
+  /^https:\/\/[a-z0-9][a-z0-9-]*\.vercel\.app$/i,
+  /^http:\/\/localhost:\d+$/,
+  /^http:\/\/127\.0\.0\.1:\d+$/,
+]
+
+function resolveSiteUrl(req: Request): string {
+  const origin = req.headers.get('Origin')?.replace(/\/$/, '')
+  if (origin && ALLOWED_ORIGINS.some((re) => re.test(origin))) return origin
+
+  const configured = Deno.env.get('SITE_URL')?.replace(/\/$/, '')
+  if (configured) return configured
+
+  return 'http://localhost:5173'
+}
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -224,6 +252,7 @@ async function handleCreate(req: Request): Promise<Response> {
   }
 
   const gateway = getGateway()
+  const siteUrl = resolveSiteUrl(req)
 
   let initiated
   try {
@@ -235,7 +264,7 @@ async function handleCreate(req: Request): Promise<Response> {
       customerEmail: buyerEmail,
       customerPhone: buyerWhatsapp,
       productTitle: product.title,
-      returnUrl: `${SITE_URL}/checkout/return?order=${order.id}`,
+      returnUrl: `${siteUrl}/checkout/return?order=${order.id}`,
       webhookUrl: `${SUPABASE_URL}/functions/v1/payments/webhook`,
     })
   } catch (err) {
